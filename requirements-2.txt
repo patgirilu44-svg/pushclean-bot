@@ -1,0 +1,22 @@
+# PushClean — Python dependencies
+# Generated April 2026
+# Deploy: pip install -r requirements.txt
+
+# ── Server ────────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── Env management ───────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Optional: AI providers (set whichever keys you use in Render dashboard) ──
+# Uncomment the provider(s) you need if using direct API keys instead of OpenRouter.
+# Pinned to known-good versions — update intentionally, not automatically.
+# openai>=1.30.0,<2.0.0          # if using OpenRouter (openai-compatible endpoint)
+# anthropic>=0.25.0,<1.0.0       # if using Anthropic directly
+# google-generativeai>=0.5.0,<1.0.0  # if using Gemini directly
+
+# ── Note: SQLite is built into Python — no extra install needed ──────────────
