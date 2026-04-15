@@ -1,7 +1,7 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
 ║          MASTER ORCHESTRATOR — PushClean Bot                     ║
-║                         FIXED v1.2                               ║
+║                         FIXED v1.3                               ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -21,8 +21,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from cleaner_bot import (
-    GitHubClient, call_claude, call_deepseek, call_gemini,
-    verify_refinement, CONFIG,
+    GitHubClient, verify_refinement, CONFIG, _gemma_call
 )
 from fine_tuning_layer import FineTuningLayer
 from self_learning import SelfLearningEngine
@@ -333,44 +332,16 @@ class SmartAPICaller:
             logger.warning("Failed to record api_spend for model '%s'", cost_key)
 
     def for_refining(self, prompt: str, max_tokens: int = 4000) -> Optional[str]:
-        result = call_deepseek(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("deepseek", "deepseek")
-            return result
-        result = call_claude(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("claude", "claude")
-        return result
+        return _gemma_call(prompt, max_tokens)
 
     def for_analysis(self, prompt: str, max_tokens: int = 1000) -> Optional[str]:
-        result = call_claude(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("claude", "claude_analysis")
-            return result
-        result = call_deepseek(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("deepseek", "deepseek_analysis")
-        return result
+        return _gemma_call(prompt, max_tokens)
 
     def for_verification(self, prompt: str, max_tokens: int = 500) -> Optional[str]:
-        result = call_gemini(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("gemini", "gemini")
-            return result
-        result = call_deepseek(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("deepseek", "deepseek_verify")
-        return result
+        return _gemma_call(prompt, max_tokens)
 
     def general(self, prompt: str, max_tokens: int = 800) -> Optional[str]:
-        result = call_deepseek(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("deepseek", "deepseek_cheap")
-            return result
-        result = call_claude(prompt, max_tokens=max_tokens)
-        if result:
-            self._track("claude", "claude")
-        return result
+        return _gemma_call(prompt, max_tokens)
 
     def get_usage_report(self) -> dict:
         return {
@@ -378,7 +349,7 @@ class SmartAPICaller:
             "total_calls": sum(self.call_counts.values()),
             "estimated_cost_usd": round(self.cost_estimate, 4),
             "budget_usd": self._budget if self._budget > 0 else "unlimited",
-        }class MasterOrchestrator:
+    }class MasterOrchestrator:
     _BOT_COMMIT_PREFIX = "\U0001f916"
 
     def __init__(self) -> None:
@@ -477,221 +448,220 @@ class SmartAPICaller:
             self._run_stats["files_failed"] += 1
             duration = time.time() - file_start
             self._log_file_run(path, language, duration, False, 0.0, 0, error_msg=str(exc))
-            return False, original_code, 0.0def _run_file_pipeline(
-    self,
-    file_info: dict,
-    path: str,
-    language: str,
-    original_code: str,
-    sha: str,
-    all_files: list,
-    commit_branch: str,
-    file_start: float,
-    co_decision: Optional[dict] = None,
-) -> tuple[bool, str, float]:
-    import time
-    import random
-    import hashlib
-    from pathlib import Path
+            return False, original_code, 0.0    def _run_file_pipeline(
+        self,
+        file_info: dict,
+        path: str,
+        language: str,
+        original_code: str,
+        sha: str,
+        all_files: list,
+        commit_branch: str,
+        file_start: float,
+        co_decision: Optional[dict] = None,
+    ) -> tuple[bool, str, float]:
+        import time
+        import random
+        import hashlib
+        from pathlib import Path
 
-    try:
-        from cleaner_bot import verify_refinement
-    except ImportError:
-        from system.cleaner_bot import verify_refinement
+        def _fetch_fresh_sha(attempts: int = 2) -> str:
+            for attempt in range(attempts):
+                try:
+                    _, fresh = self.gh.get_file_content(file_info)
+                    if fresh:
+                        return fresh
+                except Exception:
+                    pass
+                if attempt < attempts - 1:
+                    time.sleep(1)
+            return ""
 
-    def _fetch_fresh_sha(attempts: int = 2) -> str:
-        for attempt in range(attempts):
-            try:
-                _, fresh = self.gh.get_file_content(file_info)
-                if fresh:
-                    return fresh
-            except Exception:
-                pass
-            if attempt < attempts - 1:
-                time.sleep(1)
-        return ""
+        co_decision = co_decision or {}
+        co_issues = co_decision.get("local_issues", [])
+        co_fixes = co_decision.get("suggested_fixes", [])
+        co_balance = co_decision.get("balance_mode", "medium")
 
-    co_decision = co_decision or {}
-    co_issues = co_decision.get("local_issues", [])
-    co_fixes = co_decision.get("suggested_fixes", [])
-    co_balance = co_decision.get("balance_mode", "medium")
+        _content_hash = hashlib.sha256(
+            original_code.encode("utf-8", errors="replace")
+        ).hexdigest()
 
-    _content_hash = hashlib.sha256(
-        original_code.encode("utf-8", errors="replace")
-    ).hexdigest()
-
-    _vlog("  [1/4] Building enhanced context...")
-    enhanced_ctx = self.fine_tuner.build_enhanced_prompt(
-        path, language, original_code, all_files
-    )
-
-    rule_markers = ["RULE:", "STANDARD:", "PATTERN:"]
-    rules_in_ctx = sum(enhanced_ctx.count(m) for m in rule_markers)
-    if rules_in_ctx:
-        _vlog(f"        -> {rules_in_ctx} context rules loaded")
-        self._run_stats["rules_applied"] += rules_in_ctx
-
-    if co_issues:
-        co_ctx = "\n\n=== PRE-FLIGHT LOCAL ANALYSIS ===\n"
-        co_ctx += "Static analysis found these issues - prioritize fixing them:\n"
-        for issue, fix in zip(co_issues[:6], co_fixes[:6]):
-            co_ctx += f"ISSUE: {issue}\nFIX:   {fix}\n"
-        co_ctx += "=== END PRE-FLIGHT ===\n"
-        enhanced_ctx += co_ctx
-        _vlog(f"        -> {len(co_issues)} pre-flight issue(s) injected into context")
-
-    _vlog("  [2/4] Self-learning refine...")
-    full_input = f"{enhanced_ctx}\n\nCODE TO REFINE:\n{original_code}"
-
-    refine_result = self.self_learner.refine(
-        full_input, path, language, self.repo_name
-    )
-
-    if isinstance(refine_result, tuple):
-        refined_code, self_score, iterations = refine_result
-    else:
-        refined_code = refine_result
-        self_score = 0.0
-        iterations = 1
-
-    try:
-        self_score = float(self_score)
-        if self_score != self_score or self_score < 0:
-            self_score = 0.0
-        self_score = min(self_score, 10.0)
-    except (TypeError, ValueError):
-        self_score = 0.0
-
-    session_rules = getattr(self.self_learner, "session_rules_learned", 0)
-    if session_rules:
-        self._run_stats["rules_learned"] += session_rules
-
-    if not refined_code or refined_code.strip() == original_code.strip():
-        _vlog("  ✨ Already optimal — skipping")
-        self._run_stats["files_skipped"] += 1
-        duration = time.time() - file_start
-        self._log_file_run(path, language, duration, False, 10.0, iterations)
-        if self._cost_log is not None:
-            self._cost_log.record(
-                _content_hash, "refine", success=True, score=1.0,
-                balance_mode=co_balance,
-            )
-        return False, original_code, 10.0
-
-    refined_code = self._clean_code(refined_code, original_code)_should_verify = co_decision.get("should_verify", True) if co_decision else True
-_vlog(f"  [3/4] Final verification {'(running)' if _should_verify else '(skipped — CostOpt MEDIUM/clean)'}...")
-
-verification: dict = {}
-if _should_verify:
-    try:
-        verification = verify_refinement(original_code, refined_code, path)
-    except Exception as exc:
-        logger.warning("verify_refinement raised %s - treating as unsafe", exc)
-        verification = {}
-else:
-    verification = {"safe_to_commit": True, "reason": "skipped by CostOpt MEDIUM"}
-
-if not verification or not verification.get("safe_to_commit", False):
-    reason = (
-        verification.get("reason", "verifier returned no result")
-        if verification else "verifier raised exception"
-    )
-    _vlog(f"  ⛔ Verification failed: {reason}")
-    self._run_stats["files_failed"] += 1
-    duration = time.time() - file_start
-    self._log_file_run(path, language, duration, False, self_score, iterations,
-                       error_msg=f"verification: {reason}")
-    if self._cost_log is not None:
-        self._cost_log.record(
-            _content_hash, "refine", success=False, score=None,
-            balance_mode=co_balance,
-        )
-    return False, original_code, 0.0
-
-improvements = verification.get("improvements_made", [])
-if improvements:
-    _vlog(f"  ✅ Verified: {improvements[0]}")
-
-_vlog("  [4/4] Re-fetching SHA then committing...")
-
-improvements_str = ", ".join(improvements[:2]) if improvements else "AI refinement"
-raw_msg = f"🤖 [{language}] {Path(path).name}: {improvements_str}"
-commit_msg = _truncate_commit_msg(raw_msg)
-
-max_commit_retries = 3
-base_delay = 1.0
-commit_success = False
-commit_sha = ""
-last_error = ""
-
-for attempt in range(max_commit_retries):
-    try:
-        fresh_sha = _fetch_fresh_sha()
-        if not fresh_sha:
-            logger.warning(f"Could not fetch fresh SHA for {path}")
-            last_error = "sha_fetch_failed"
-            if attempt < max_commit_retries - 1:
-                continue
-            else:
-                break
-        sha = fresh_sha
-
-        commit_sha = self.gh.commit_file(
-            path, refined_code, sha, commit_branch, commit_msg
+        _vlog("  [1/4] Building enhanced context...")
+        enhanced_ctx = self.fine_tuner.build_enhanced_prompt(
+            path, language, original_code, all_files
         )
 
-        if commit_sha:
-            commit_success = True
-            break
+        rule_markers = ["RULE:", "STANDARD:", "PATTERN:"]
+        rules_in_ctx = sum(enhanced_ctx.count(m) for m in rule_markers)
+        if rules_in_ctx:
+            _vlog(f"        -> {rules_in_ctx} context rules loaded")
+            self._run_stats["rules_applied"] += rules_in_ctx
+
+        if co_issues:
+            co_ctx = "\n\n=== PRE-FLIGHT LOCAL ANALYSIS ===\n"
+            co_ctx += "Static analysis found these issues - prioritize fixing them:\n"
+            for issue, fix in zip(co_issues[:6], co_fixes[:6]):
+                co_ctx += f"ISSUE: {issue}\nFIX:   {fix}\n"
+            co_ctx += "=== END PRE-FLIGHT ===\n"
+            enhanced_ctx += co_ctx
+            _vlog(f"        -> {len(co_issues)} pre-flight issue(s) injected into context")
+
+        _vlog("  [2/4] Self-learning refine...")
+        full_input = f"{enhanced_ctx}\n\nCODE TO REFINE:\n{original_code}"
+
+        refine_result = self.self_learner.refine(
+            full_input, path, language, self.repo_name
+        )
+
+        if isinstance(refine_result, tuple):
+            refined_code, self_score, iterations = refine_result
         else:
-            last_error = "commit_returned_empty"
-            if attempt < max_commit_retries - 1:
-                sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 0.5)
-                _vlog(f"        -> Commit failed, retrying in {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-    except Exception as exc:
-        error_str = str(exc)
-        last_error = error_str
-        if "409" in error_str or "does not match" in error_str.lower():
-            if attempt < max_commit_retries - 1:
-                sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 0.5)
-                _vlog(f"        -> SHA conflict (409), retrying in {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-                continue
-        logger.warning(f"Commit exception for {path}: {exc}")
+            refined_code = refine_result
+            self_score = 0.0
+            iterations = 1
 
-duration = time.time() - file_start
+        try:
+            self_score = float(self_score)
+            if self_score != self_score or self_score < 0:
+                self_score = 0.0
+            self_score = min(self_score, 10.0)
+        except (TypeError, ValueError):
+            self_score = 0.0
 
-if commit_success and commit_sha:
-    _vlog(f"  ✅ Committed! ({duration:.1f}s) — score {self_score:.1f}/10")
-    self._run_stats["files_refined"] += 1
-    self._run_stats["scores"].append(self_score)
-    self.fine_tuner.record_success(path, language, improvements, "orchestrator")
-    self._log_file_run(
-        path, language, duration, True,
-        self_score, iterations, commit_sha,
-    )
-    if self._cost_log is not None:
-        self._cost_log.record(
-            _content_hash, "refine",
-            success=True,
-            score=round(min(self_score, 10.0) / 10.0, 3),
-            balance_mode=co_balance,
-        )
-    if hasattr(self, "_file_shas_cache") and isinstance(self._file_shas_cache, dict):
-        self._file_shas_cache[path] = commit_sha
-    return True, refined_code, self_score
-else:
-    _vlog(f"  ❌ Commit failed ({duration:.1f}s)")
-    self._run_stats["files_failed"] += 1
-    self._log_file_run(path, language, duration, False, self_score, iterations,
-                       error_msg=last_error or "commit failed after retries")
-    if self._cost_log is not None:
-        self._cost_log.record(
-            _content_hash, "refine", success=False, score=None,
-            balance_mode=co_balance,
-        )
-    return False, original_code, 0.0    def run(self, trigger: str = "manual", changed_files: Optional[list] = None) -> None:
+        session_rules = getattr(self.self_learner, "session_rules_learned", 0)
+        if session_rules:
+            self._run_stats["rules_learned"] += session_rules
+
+        if not refined_code or refined_code.strip() == original_code.strip():
+            _vlog("  ✨ Already optimal — skipping")
+            self._run_stats["files_skipped"] += 1
+            duration = time.time() - file_start
+            self._log_file_run(path, language, duration, False, 10.0, iterations)
+            if self._cost_log is not None:
+                self._cost_log.record(
+                    _content_hash, "refine", success=True, score=1.0,
+                    balance_mode=co_balance,
+                )
+            return False, original_code, 10.0
+
+        refined_code = self._clean_code(refined_code, original_code)
+
+        _should_verify = co_decision.get("should_verify", True) if co_decision else True
+        _vlog(f"  [3/4] Final verification {'(running)' if _should_verify else '(skipped — CostOpt MEDIUM/clean)'}...")
+
+        verification: dict = {}
+        if _should_verify:
+            try:
+                verification = verify_refinement(original_code, refined_code, path)
+            except Exception as exc:
+                logger.warning("verify_refinement raised %s - treating as unsafe", exc)
+                verification = {}
+        else:
+            verification = {"safe_to_commit": True, "reason": "skipped by CostOpt MEDIUM"}
+
+        if not verification or not verification.get("safe_to_commit", False):
+            reason = (
+                verification.get("reason", "verifier returned no result")
+                if verification else "verifier raised exception"
+            )
+            _vlog(f"  ⛔ Verification failed: {reason}")
+            self._run_stats["files_failed"] += 1
+            duration = time.time() - file_start
+            self._log_file_run(path, language, duration, False, self_score, iterations,
+                               error_msg=f"verification: {reason}")
+            if self._cost_log is not None:
+                self._cost_log.record(
+                    _content_hash, "refine", success=False, score=None,
+                    balance_mode=co_balance,
+                )
+            return False, original_code, 0.0
+
+        improvements = verification.get("improvements_made", [])
+        if improvements:
+            _vlog(f"  ✅ Verified: {improvements[0]}")
+
+        improvements_str = ", ".join(improvements[:2]) if improvements else "AI refinement"
+        raw_msg = f"🤖 [{language}] {Path(path).name}: {improvements_str}"
+        commit_msg = _truncate_commit_msg(raw_msg)
+
+        _vlog("  [4/4] Re-fetching SHA then committing...")
+
+        max_commit_retries = 3
+        base_delay = 1.0
+        commit_success = False
+        commit_sha = ""
+        last_error = ""
+
+        for attempt in range(max_commit_retries):
+            try:
+                fresh_sha = _fetch_fresh_sha()
+                if not fresh_sha:
+                    logger.warning(f"Could not fetch fresh SHA for {path}")
+                    last_error = "sha_fetch_failed"
+                    if attempt < max_commit_retries - 1:
+                        continue
+                    else:
+                        break
+                sha = fresh_sha
+
+                commit_sha = self.gh.commit_file(
+                    path, refined_code, sha, commit_branch, commit_msg
+                )
+
+                if commit_sha:
+                    commit_success = True
+                    break
+                else:
+                    last_error = "commit_returned_empty"
+                    if attempt < max_commit_retries - 1:
+                        sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 0.5)
+                        _vlog(f"        -> Commit failed, retrying in {sleep_time:.1f}s...")
+                        time.sleep(sleep_time)
+            except Exception as exc:
+                error_str = str(exc)
+                last_error = error_str
+                if "409" in error_str or "does not match" in error_str.lower():
+                    if attempt < max_commit_retries - 1:
+                        sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0, 0.5)
+                        _vlog(f"        -> SHA conflict (409), retrying in {sleep_time:.1f}s...")
+                        time.sleep(sleep_time)
+                        continue
+                logger.warning(f"Commit exception for {path}: {exc}")
+
+        duration = time.time() - file_start
+
+        if commit_success and commit_sha:
+            _vlog(f"  ✅ Committed! ({duration:.1f}s) — score {self_score:.1f}/10")
+            self._run_stats["files_refined"] += 1
+            self._run_stats["scores"].append(self_score)
+            self.fine_tuner.record_success(path, language, improvements, "orchestrator")
+            self._log_file_run(
+                path, language, duration, True,
+                self_score, iterations, commit_sha,
+            )
+            if self._cost_log is not None:
+                self._cost_log.record(
+                    _content_hash, "refine",
+                    success=True,
+                    score=round(min(self_score, 10.0) / 10.0, 3),
+                    balance_mode=co_balance,
+                )
+            if hasattr(self, "_file_shas_cache") and isinstance(self._file_shas_cache, dict):
+                self._file_shas_cache[path] = commit_sha
+            return True, refined_code, self_score
+        else:
+            _vlog(f"  ❌ Commit failed ({duration:.1f}s)")
+            self._run_stats["files_failed"] += 1
+            self._log_file_run(path, language, duration, False, self_score, iterations,
+                               error_msg=last_error or "commit failed after retries")
+            if self._cost_log is not None:
+                self._cost_log.record(
+                    _content_hash, "refine", success=False, score=None,
+                    balance_mode=co_balance,
+                )
+            return False, original_code, 0.0
+
+    def run(self, trigger: str = "manual", changed_files: Optional[list] = None) -> None:
         acquired, _lock_id = acquire_run_lock("main")
         if not acquired:
             logger.warning("Another orchestration run is already active — aborting")
